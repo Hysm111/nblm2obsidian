@@ -177,11 +177,12 @@ def parse_notebook_url(url: str) -> str | None:
     if parsed.netloc not in ("notebooklm.google.com", "notebook.google.com"):
         return None
     
-    # Pattern: /notebook/<id> or /share/<id>
+    # Pattern: /notebook/<id>, /notebook/<id>/preview, /share/<id>
     path = parsed.path.strip('/')
     parts = path.split('/')
     
     if len(parts) >= 2 and parts[0] in ("notebook", "share"):
+        # For /notebook/<id>/preview, the ID is at index 1
         return parts[1]
     
     return None

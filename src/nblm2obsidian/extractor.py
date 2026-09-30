@@ -103,7 +103,7 @@ class PublicNotebookExtractor:
         warnings = []
         
         # First, check if the notebook is publicly accessible
-        is_accessible, share_status = await self._check_public_access(notebook_id)
+        is_accessible, share_status = await self._check_public_access(notebook_id, share_url)
         if not is_accessible:
             raise NotebookNotAccessibleError(
                 f"Notebook {notebook_id} is not publicly accessible or does not exist",
@@ -132,38 +132,52 @@ class PublicNotebookExtractor:
         
         return ExtractionResult(notebook=notebook, warnings=warnings)
     
-    async def _check_public_access(self, notebook_id: str) -> tuple[bool, dict[str, Any]]:
+    async def _check_public_access(self, notebook_id: str, share_url: str | None = None) -> tuple[bool, dict[str, Any]]:
         """Check if a notebook is publicly accessible by fetching the share page."""
-        # Try to access the notebook page directly
-        url = f"https://notebook.google.com/notebook/{notebook_id}"
+        # Determine the URL to check - use the share_url if provided, otherwise default
+        urls_to_try = []
         
-        try:
-            resp = await self._client.get(url)
-            final_url = str(resp.url)
-            
-            # If we're redirected to login, the notebook is not publicly accessible
-            if "accounts.google.com" in final_url or "signin" in final_url:
-                self._log(f"Notebook {notebook_id} redirects to login - not publicly accessible")
-                return False, {}
-            
-            # Check if the page contains notebook data
-            if self._page_contains_notebook_data(resp.text):
-                self._log(f"Notebook {notebook_id} page contains notebook data")
-                return True, {"share_url": url, "is_public": True}
-            
-            # Try to get share status via RPC
-            share_status = await self._get_share_status_rpc(notebook_id)
-            if share_status.get("is_public"):
-                return True, share_status
-            
-            return False, {}
-            
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 404:
-                raise NotebookNotFoundError(notebook_id)
-            raise NetworkError(f"HTTP error checking access: {e}", url=url, status_code=e.response.status_code)
-        except httpx.RequestError as e:
-            raise NetworkError(f"Network error checking access: {e}", url=url)
+        if share_url:
+            parsed = urlparse(share_url)
+            base_url = f"{parsed.scheme}://{parsed.netloc}"
+            # Add the original share URL
+            urls_to_try.append(share_url)
+            # Also try the base notebook URL (without /preview)
+            if "/preview" in parsed.path:
+                base_path = parsed.path.replace("/preview", "")
+                urls_to_try.append(f"{base_url}{base_path}")
+        else:
+            urls_to_try.append(f"https://notebook.google.com/notebook/{notebook_id}")
+        
+        for url in urls_to_try:
+            try:
+                resp = await self._client.get(url)
+                final_url = str(resp.url)
+                
+                # If we're redirected to login, try next URL
+                if "accounts.google.com" in final_url or "signin" in final_url:
+                    self._log(f"Notebook {notebook_id} redirects to login at {url}")
+                    continue
+                
+                # Check if the page contains notebook data
+                if self._page_contains_notebook_data(resp.text):
+                    self._log(f"Notebook {notebook_id} page contains notebook data at {url}")
+                    return True, {"share_url": share_url or url, "is_public": True}
+                
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 404:
+                    continue  # Try next URL
+                raise NetworkError(f"HTTP error checking access: {e}", url=url, status_code=e.response.status_code)
+            except httpx.RequestError as e:
+                self._log(f"Network error checking {url}: {e}")
+                continue
+        
+        # Try to get share status via RPC as fallback
+        share_status = await self._get_share_status_rpc(notebook_id)
+        if share_status.get("is_public"):
+            return True, share_status
+        
+        return False, {}
     
     def _page_contains_notebook_data(self, html: str) -> bool:
         """Check if the HTML page contains notebook data (not just login page)."""

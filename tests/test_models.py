@@ -64,6 +64,14 @@ class TestParseNotebookURL:
         url = "https://notebooklm.google.com/notebook/abc123?foo=bar"
         assert parse_notebook_url(url) == "abc123"
     
+    def test_notebook_preview_path(self):
+        url = "https://notebook.google.com/notebook/70ce5f5c-a45d-40e9-9fce-6d189cb49cb2/preview"
+        assert parse_notebook_url(url) == "70ce5f5c-a45d-40e9-9fce-6d189cb49cb2"
+    
+    def test_notebooklm_preview_path(self):
+        url = "https://notebooklm.google.com/notebook/70ce5f5c-a45d-40e9-9fce-6d189cb49cb2/preview"
+        assert parse_notebook_url(url) == "70ce5f5c-a45d-40e9-9fce-6d189cb49cb2"
+    
     def test_invalid_domain(self):
         url = "https://example.com/notebook/abc123"
         assert parse_notebook_url(url) is None
