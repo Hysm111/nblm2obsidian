@@ -22,6 +22,12 @@ from .errors import (
     NotebookNotFoundError,
     VaultError,
 )
+from .auth import get_auth_manager
+from .extractor_auth import (
+    AuthenticatedNotebookExtractor,
+    inspect_notebook_authenticated,
+    list_sources_authenticated,
+)
 
 console = Console()
 
@@ -50,13 +56,124 @@ def print_info(msg: str):
 @click.group()
 @click.version_option(version="0.1.0", prog_name="nblm2obsidian")
 def cli():
-    """nblm2obsidian - Import publicly shared Google NotebookLM notebooks into Obsidian vaults.
+    """nblm2obsidian - Import Google NotebookLM notebooks into Obsidian vaults.
 
-    This tool extracts content from publicly shared NotebookLM notebooks
+    This tool extracts content from NotebookLM notebooks (public or authenticated)
     and converts them to Obsidian-compatible Markdown files.
     """
     pass
 
+
+# ===== Authentication Commands =====
+
+@cli.command()
+@click.option(
+    "--browser",
+    type=click.Choice(["chromium", "chrome", "msedge"], case_sensitive=False),
+    default="chromium",
+    help="Browser to use for login (default: chromium)",
+)
+@click.option(
+    "--timeout",
+    type=click.IntRange(min=30),
+    default=300,
+    help="Seconds to wait for login completion (default: 300)",
+)
+@click.option(
+    "--storage-state",
+    type=click.Path(exists=True, file_okay=True, dir_okay=False, path_type=Path),
+    help="Path to an existing storage_state.json file to import (created on another device with Playwright)",
+)
+@click.option("--verbose", is_flag=True, help="Verbose output")
+def login(browser: str, timeout: int, storage_state: Optional[Path], verbose: bool):
+    """Log in to NotebookLM and save session for authenticated access.
+
+    Two modes:
+    
+    1. Browser login (requires Playwright/Chromium):
+       nblm2obsidian login
+       Opens a browser window for Google login. Requires Playwright/Chromium.
+    
+    2. Import existing session (works on Termux/Android):
+       nblm2obsidian login --storage-state /path/to/storage_state.json
+       Imports a storage_state.json file created on another device (e.g., desktop
+       with Playwright/Chromium). No browser automation needed.
+    """
+    auth_manager = get_auth_manager()
+    
+    if auth_manager.is_authenticated():
+        print_warning("Already authenticated. Use 'nblm2obsidian logout' first to switch accounts.")
+        return
+    
+    if storage_state:
+        # Import existing storage state
+        if verbose:
+            print_info(f"Importing storage state from {storage_state}...")
+        
+        success = auth_manager.import_storage_state(storage_state)
+        
+        if success:
+            print_success("Storage state imported successfully! Session saved.")
+            status = auth_manager.get_status()
+            print_info(f"Session stored at: {status['storage_path']}")
+        else:
+            print_error("Failed to import storage state. Please verify the file is a valid storage_state.json.")
+    else:
+        # Browser-based login
+        def run_login():
+            if verbose:
+                print_info(f"Starting browser login with {browser}...")
+            
+            success = auth_manager.login(browser=browser, timeout=timeout)
+            
+            if success:
+                print_success("Login successful! Session saved.")
+                status = auth_manager.get_status()
+                print_info(f"Session stored at: {status['storage_path']}")
+            else:
+                print_error("Login failed. Please try again.")
+        
+        run_login()
+
+
+@cli.command()
+@click.option("--verbose", is_flag=True, help="Verbose output")
+def logout(verbose: bool):
+    """Log out and remove saved NotebookLM session."""
+    auth_manager = get_auth_manager()
+    
+    if not auth_manager.is_authenticated():
+        print_info("Not currently authenticated.")
+        return
+    
+    if auth_manager.logout():
+        print_success("Logged out successfully. Session removed.")
+    else:
+        print_error("Logout failed.")
+
+
+@cli.command()
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+@click.option("--verbose", is_flag=True, help="Verbose output")
+def status(json_output: bool, verbose: bool):
+    """Show authentication status."""
+    auth_manager = get_auth_manager()
+    status_info = auth_manager.get_status()
+    
+    if json_output:
+        console.print_json(json.dumps(status_info))
+        return
+    
+    if status_info["authenticated"]:
+        print_success("Authenticated")
+        print_info(f"Session: {status_info['storage_path']}")
+        print_info(f"Config dir: {status_info['config_dir']}")
+    else:
+        print_warning("Not authenticated")
+        print_info("Run 'nblm2obsidian login' to authenticate.")
+
+
+# ===== Notebook Commands =====
 
 @cli.command()
 @click.argument("url")
@@ -79,14 +196,14 @@ def import_cmd(
     json_output: bool,
     verbose: bool,
 ):
-    """Import a public NotebookLM notebook into an Obsidian vault or directory."""
-    
-    # Validate URL
+    """Import a NotebookLM notebook into an Obsidian vault or directory.
+
+    Uses authenticated access if logged in, otherwise tries public access.
+    """
     notebook_id = parse_notebook_url(url)
     if not notebook_id:
         print_error(f"Invalid NotebookLM share URL: {url}")
     
-    # Validate output target
     if not vault and not output:
         print_error("Either --vault or --output must be specified")
     if vault and output:
@@ -95,27 +212,43 @@ def import_cmd(
     target = vault or output
     is_vault = vault is not None
     
+    auth_manager = get_auth_manager()
+    use_auth = auth_manager.is_authenticated()
+    
     async def run_import():
         if verbose:
             print_info(f"Importing notebook {notebook_id} from {url}")
             print_info(f"Target: {target} ({'vault' if is_vault else 'directory'})")
+            print_info(f"Mode: {'authenticated' if use_auth else 'public'}")
         
         try:
-            if is_vault:
-                result = await import_notebook(
-                    url=url,
-                    vault_path=target,
-                    folder=folder,
-                    force=force,
-                    dry_run=dry_run,
-                    verbose=verbose,
-                )
-            else:
-                # Use export_to_markdown for non-vault output
-                async with __import__('nblm2obsidian.extractor', fromlist=['PublicNotebookExtractor']).PublicNotebookExtractor(verbose=verbose) as extractor:
+            if use_auth:
+                # Use authenticated extractor
+                async with AuthenticatedNotebookExtractor(verbose=verbose) as extractor:
                     extract_result = await extractor.extract_from_url(url)
                 notebook = extract_result.notebook
                 warnings = extract_result.warnings
+            else:
+                # Use public extractor
+                from .extractor import PublicNotebookExtractor
+                async with PublicNotebookExtractor(verbose=verbose) as extractor:
+                    extract_result = await extractor.extract_from_url(url)
+                notebook = extract_result.notebook
+                warnings = extract_result.warnings
+            
+            if is_vault:
+                from .obsidian import VaultWriter
+                writer = VaultWriter(target, folder=folder, force=force, dry_run=dry_run)
+                target_dir, written_files = writer.write(notebook)
+                from .notebooklm import ImportResult
+                result = ImportResult(
+                    notebook=notebook,
+                    target_dir=target_dir,
+                    written_files=written_files,
+                    warnings=warnings,
+                )
+            else:
+                from .notebooklm import export_to_markdown
                 written_files = export_to_markdown(
                     notebook=notebook,
                     output_dir=target / (folder or notebook.metadata.title),
@@ -138,6 +271,7 @@ def import_cmd(
                     "files_written": len(result.written_files),
                     "warnings": result.warnings,
                     "dry_run": dry_run,
+                    "mode": "authenticated" if use_auth else "public",
                 }
                 console.print_json(json.dumps(output_data))
                 return
@@ -152,7 +286,6 @@ def import_cmd(
                 for w in result.warnings:
                     print_warning(w)
             
-            # Show structure
             if not json_output and not dry_run:
                 console.print("\n[bold]Structure:[/bold]")
                 console.print(f"  {result.target_dir.name}/")
@@ -183,29 +316,39 @@ def import_cmd(
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.option("--verbose", is_flag=True, help="Verbose output")
 def inspect(url: str, json_output: bool, verbose: bool):
-    """Inspect a public NotebookLM notebook to see what's accessible without downloading."""
-    
+    """Inspect a NotebookLM notebook to see what's accessible.
+
+    Uses authenticated access if logged in, otherwise tries public access.
+    """
     notebook_id = parse_notebook_url(url)
     if not notebook_id:
         print_error(f"Invalid NotebookLM share URL: {url}")
     
+    auth_manager = get_auth_manager()
+    use_auth = auth_manager.is_authenticated()
+    
     async def run_inspect():
         if verbose:
             print_info(f"Inspecting notebook {notebook_id}...")
+            print_info(f"Mode: {'authenticated' if use_auth else 'public'}")
         
         try:
-            result = await inspect_notebook_public(url, verbose=verbose)
+            if use_auth:
+                result = await inspect_notebook_authenticated(url, verbose=verbose)
+            else:
+                result = await inspect_notebook_public(url, verbose=verbose)
             
             if json_output:
                 console.print_json(json.dumps(result))
                 return
             
             # Display results
-            accessible = result.get("is_publicly_accessible", False)
+            is_accessible = result.get("is_publicly_accessible", False) or result.get("is_authenticated", False)
             
-            if accessible:
+            if is_accessible:
+                mode = "authenticated" if result.get("is_authenticated") else "public"
                 console.print(Panel.fit(
-                    f"[green]✓ Publicly Accessible[/green]\n"
+                    f"[green]✓ Accessible ({mode})[/green]\n"
                     f"Title: {result.get('title', 'Unknown')}\n"
                     f"Sources: {result.get('source_count', 0)}\n"
                     f"Notes: {result.get('notes_count', 0)}\n"
@@ -219,9 +362,10 @@ def inspect(url: str, json_output: bool, verbose: bool):
                     for sid in result["source_ids"]:
                         console.print(f"  - {sid}")
             else:
+                error_msg = result.get('error', 'Unknown reason')
                 console.print(Panel.fit(
-                    f"[red]✗ Not Publicly Accessible[/red]\n"
-                    f"{result.get('error', 'Unknown reason')}",
+                    f"[red]✗ Not Accessible[/red]\n"
+                    f"{error_msg}",
                     title=f"Notebook: {notebook_id}",
                     border_style="red",
                 ))
@@ -246,18 +390,27 @@ def inspect(url: str, json_output: bool, verbose: bool):
 @click.option("--json", "json_output", is_flag=True, help="Output as JSON")
 @click.option("--verbose", is_flag=True, help="Verbose output")
 def sources(url: str, json_output: bool, verbose: bool):
-    """List all sources in a public NotebookLM notebook."""
-    
+    """List all sources in a NotebookLM notebook.
+
+    Uses authenticated access if logged in, otherwise tries public access.
+    """
     notebook_id = parse_notebook_url(url)
     if not notebook_id:
         print_error(f"Invalid NotebookLM share URL: {url}")
     
+    auth_manager = get_auth_manager()
+    use_auth = auth_manager.is_authenticated()
+    
     async def run_sources():
         if verbose:
             print_info(f"Fetching sources for notebook {notebook_id}...")
+            print_info(f"Mode: {'authenticated' if use_auth else 'public'}")
         
         try:
-            source_list = await get_notebook_sources(url, verbose=verbose)
+            if use_auth:
+                source_list = await list_sources_authenticated(url, verbose=verbose)
+            else:
+                source_list = await get_notebook_sources(url, verbose=verbose)
             
             if json_output:
                 console.print_json(json.dumps(source_list))
@@ -326,8 +479,7 @@ def export(
     json_output: bool,
     verbose: bool,
 ):
-    """Export a public NotebookLM notebook to Markdown files (alias for import)."""
-    # Reuse import logic
+    """Export a NotebookLM notebook to Markdown files (alias for import)."""
     ctx = click.get_current_context()
     ctx.invoke(import_cmd, url=url, vault=vault, output=output, folder=folder,
                force=force, dry_run=dry_run, json_output=json_output, verbose=verbose)
